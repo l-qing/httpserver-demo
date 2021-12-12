@@ -1,0 +1,49 @@
+spec:
+  workspaces:
+    - description: >
+        This workspace is shared among all the pipeline tasks to read/write
+        common resources
+      name: source
+  tasks:
+    - name: build-image
+      runAfter:
+        - git-clone
+      taskRef:
+        kind: ClusterTask
+        name: build-image
+      params:
+        - name: container-image # 配置构建的目标镜像地址
+          value: 192.168.133.36:31200/devops/httpserver
+        - name: container-image-tag # 配置目标镜像的tag 版本
+          value: $(tasks.git-clone.results.commit-short-id)
+        - name: BUILD_EXTRA_ARGS
+          value: --storage-driver vfs --tls-verify=false
+        - name: PUSH_EXTRA_ARGS
+          value: --storage-driver vfs --tls-verify=false
+      workspaces:
+        - name: source
+          workspace: source
+    - name: change-manifests
+      runAfter:
+        - build-image
+      taskRef:
+        kind: Task
+        name: change-manifests
+      params:
+        - name: SCHEMA
+          value: http
+        - name: GIT_URL
+          value: 192.168.133.35:31100/demo/httpserver-demo-kustomize.git
+        - name: BASIC_AUTH
+          value: gitlab-auth
+        - name: GIT_BRANCH
+          value: $(params.git-revision)
+        - name: GIT_MANIFEST_DIR
+          value: .
+        - name: TOOL_IMAGE # 该镜像中必须要有 git，另外还需要能成功执行下面的脚本。比如这里就需要能执行make命令。
+          value: golang:1.17
+        - name: UPDATE_SCRIPT
+          value: |
+            IMAGE=192.168.133.36:31200/devops/httpserver \
+            IMAGE_TAG=$(tasks.git-clone.results.commit-short-id) \
+            make update-deployment-image
