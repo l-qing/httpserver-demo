@@ -1,0 +1,25 @@
+FROM alpine:3.15 as builder
+
+ARG KUBECTL_VERSION="v1.21.4"
+ARG YQ_VERSION="v4.16.1"
+ARG KUSTOMIZE_VERSION="v4.4.1"
+
+RUN apk --no-cache --update add curl
+
+RUN ARCH= &&dpkgArch="$(arch)" \
+  && case "${dpkgArch}" in \
+    x86_64) ARCH='amd64';; \
+    aarch64) ARCH='arm64';; \
+    *) echo "unsupported architecture"; exit 1 ;; \
+  esac \
+  && curl --retry 6 --create-dirs -fLo /tools/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" \
+  && curl --retry 6 --create-dirs -fLo /tools/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}" \
+  && curl --retry 6 -LO https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz && tar -zxvf kustomize_${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz && mv kustomize /tools \
+  && chmod +x /tools/*
+
+
+FROM alpine:3.15
+
+RUN apk --no-cache --update add git make bash
+COPY --from=builder /tools/* /bin/
+

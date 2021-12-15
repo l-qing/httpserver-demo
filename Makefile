@@ -35,3 +35,11 @@ push-image: build-image ## push image
 run-image: ## run image
 	docker run --rm -it --name httpserver -p 8080:8080 $(IMAGE):$(IMAGE_TAG)
 
+
+TOOLS_IMAGE?=tools
+TOOLS_IMAGE_TAG?=latest
+build-tools-image:
+	docker build -f Dockerfile.tools -t ${TOOLS_IMAGE}:${TOOLS_IMAGE_TAG} ./
+push-tools-image:
+	docker push ${TOOLS_IMAGE}:${TOOLS_IMAGE_TAG}
+

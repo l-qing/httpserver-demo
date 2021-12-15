@@ -24,6 +24,7 @@ spec:
         - name: source
           workspace: source
     - name: change-manifests
+      retries: 3
       runAfter:
         - build-image
       taskRef:
@@ -41,7 +42,7 @@ spec:
         - name: GIT_MANIFEST_DIR
           value: .
         - name: TOOL_IMAGE # 该镜像中必须要有 git，另外还需要能成功执行下面的脚本。比如这里就需要能执行make命令。
-          value: golang:1.17
+          value: 190219044/kubectl-kustomize-git-yq:1.0.0
         - name: UPDATE_SCRIPT
           value: |
             IMAGE=192.168.133.36:31200/devops/httpserver \
