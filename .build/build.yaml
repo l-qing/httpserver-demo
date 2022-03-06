@@ -1,5 +1,5 @@
 apiVersion: builds.katanomi.dev/v1alpha1
-kind: BuildRun
+kind: Build
 spec:
   workspaces:
     - description: >
@@ -18,10 +18,12 @@ spec:
           value: 192.168.133.36:31200/devops/httpserver
         - name: container-image-tag # 配置目标镜像的tag 版本
           value: $(tasks.git-clone.results.commit-short-id)
-        - name: BUILD_EXTRA_ARGS
+        - name: build-extra-args
           value: --storage-driver vfs --tls-verify=false
-        - name: PUSH_EXTRA_ARGS
+        - name: push-extra-args
           value: --storage-driver vfs --tls-verify=false
+        - name: labels
+          value: []
       workspaces:
         - name: source
           workspace: source
