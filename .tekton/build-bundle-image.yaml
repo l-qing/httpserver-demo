@@ -1,0 +1,352 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-bundle-image
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.56.0"
+    tekton.dev/tags: "image-build, test, scan"
+    tekton.dev/displayName: "Clone, Multi-arch Build, Test, and Scan Pipeline"
+    tekton.dev/categories: "CICD"
+    tekton.dev/platforms: "linux/amd64,linux/arm64"
+spec:
+  description: Pipeline to clone, build amd64/arm64 images, merge into one manifest, runs optional test scripts and trivy image scan
+  params:
+    - name: git-url
+      description: Repository URL to clone from.
+      type: string
+    - name: git-revision
+      description: Revision to checkout. (branch, tag, sha, ref, etc...)
+      type: string
+    - name: git-refspec
+      description: Refspec to fetch before checking out revision.
+      default: ""
+    - name: git-commit
+      description: Commit sha used in this build
+      default: ""
+    - name: git-version
+      description: Version used in this build
+      type: string
+
+    - name: image-repository
+      description: Image repository address like build-harbor.alauda.cn/test/image-repo
+      type: string
+
+    - name: tags
+      description: >-
+        List of tags to be added to the built image. When not in master or main branch will add a suffix with commit short sha.
+        If tags is empty, or the gitversion-config-file is not default `GitVersion.yaml`,
+        this pipeline will also add a gitversion related tag, such as v1.0.0-suffix according to the gitversion config file.
+      type: array
+
+    - name: dockerfile-path
+      description: Path to the Dockerfile used to build you image i.e ./Dockerfile
+      type: string
+      default: ./Dockerfile
+
+    - name: context
+      default: "."
+      description: Path to the directory to use as context in docker build
+      type: string
+
+    - name: build-extra-args
+      type: array
+      default: []
+      description: >
+        Adds extra arguments into buildkit build arguments in the format
+        --build-arg version=abc
+
+    - name: test-script
+      type: string
+      default: ""
+      description: Test script to be used inside the built image for testing, will fail the pipeline if returns non zero code
+
+    - name: ignore-trivy-scan
+      default: "false"
+      description: Set to ignore trivy image scan after build
+
+    - name: file-list-for-commit-sha
+      type: array
+      default:
+        - "."
+      description: >
+        This list of files will be used to calculate the most recently modified commit sha.
+        It is used to set the `SOURCE_DATE_EPOCH` environment variable and version number,
+        ensuring that the image digest remains consistent when files have not changed.
+
+    - name: gitversion-config-file
+      description: Config file path
+      type: string
+      default: GitVersion.yaml
+
+  workspaces:
+    - name: source
+      description: Workspace for shared code source
+    - name: dockerconfig
+      description: >-
+        Workspace for Docker configuration files, such as `config.json` or `.dockerconfigjson`.
+        This is optional and is used for authentication when pushing images to the registry.
+      optional: true
+    - name: basic-auth
+      optional: true
+      description: >
+        A Workspace containing a .gitconfig and .git-credentials file. These
+        will be copied to the user's home before any git commands are run. Any
+        other files in this Workspace are ignored. It is strongly recommended
+        to use ssh-directory over basic-auth whenever possible and to bind a
+        Secret to this Workspace over other volume types.
+    - name: gitversion-config
+      optional: true
+      description: >
+        A Workspace containing a gitversion-config file. This file is used to set the git version.
+
+  tasks:
+    - name: git-clone
+      timeout: 10m
+      retries: 0
+      taskRef:
+        resolver: hub
+        params:
+          - name: catalog
+            value: catalog
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: version
+            value: "0.9"
+
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+
+      workspaces:
+        - name: output
+          workspace: source
+        - name: basic-auth
+          workspace: basic-auth
+
+    - name: calculate-commit-sha
+      runAfter:
+        - git-clone
+      timeout: 10m
+      retries: 0
+      params:
+        - name: image
+          value: registry.alauda.cn:60080/devops/chainguard/git:latest
+        - name: args
+          value: $(params.file-list-for-commit-sha[*])
+        - name: script
+          value: |
+            set -e
+            # Change to the source directory
+            cd $(workspaces.source.path)
+
+            # If the user is not 65532 or the path is ".", use the fast path
+            if [ "$(id -u)" -ne 65532 ] || { [ "$#" -eq 1 ] && [ "$1" == "." ]; } ; then
+                echo -n "$(tasks.git-clone.results.commit)" > $(results.string-result.path)
+                cat <<EOF > $(results.array-result.path)
+            ["$(tasks.git-clone.results.commit)", "$(tasks.git-clone.results.committer-date)"]
+            EOF
+                echo "Fast path: user: $(id -u), commit sha: $(tasks.git-clone.results.commit), commit date: $(tasks.git-clone.results.committer-date)"
+                exit 0
+            fi
+
+            ### !!! copied from git clone to solve git fetching credentials in basic auth
+            WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND=$(workspaces.secret.bound)
+            WORKSPACE_BASIC_AUTH_DIRECTORY_PATH=$(workspaces.secret.path)
+            PARAM_USER_HOME=$HOME
+            if [ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" = "true" ] ; then
+              cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.git-credentials" "${PARAM_USER_HOME}/.git-credentials"
+              cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.gitconfig" "${PARAM_USER_HOME}/.gitconfig"
+              chmod 400 "${PARAM_USER_HOME}/.git-credentials"
+              chmod 400 "${PARAM_USER_HOME}/.gitconfig"
+            fi
+
+            # Check if this is a shallow clone
+            if [ -f .git/shallow ]; then
+              echo "==> Detected shallow clone, fetching complete history..."
+              git config --global --add safe.directory $(workspaces.source.path)
+              git fetch --unshallow --tags
+            else
+              # Add the source directory to the safe.directory list
+              git config --global --add safe.directory $(workspaces.source.path)
+            fi
+
+            # Calculate the commit sha
+            git log -1 --pretty=format:"%H" -- $@ > $(results.string-result.path)
+
+            # Calculate the commit info as an object
+            git-latest-commit $@ > $(results.object-result.path)
+
+            # Calculate the commit info as an array
+            git-latest-commit-as-array $@ > $(results.array-result.path)
+
+            # Output commit information using a here document for better readability
+            cat <<EOF
+            commit sha: $(cat $(results.string-result.path))
+            commit info as array: $(cat $(results.array-result.path))
+            commit info as object: $(cat $(results.object-result.path))
+            EOF
+
+      taskRef:
+        resolver: hub
+        params:
+          - name: catalog
+            value: catalog
+          - name: kind
+            value: task
+          - name: name
+            value: run-script
+          - name: version
+            value: "0.1"
+      workspaces:
+        - name: source
+          workspace: source
+        - name: secret
+          workspace: basic-auth
+
+    - name: git-version
+      params:
+        - name: gitversion-image
+          value: registry.alauda.cn:60080/devops/gittools/gitversion:6.0.5
+        - name: yq-image
+          value: registry.alauda.cn:60080/devops/yq:latest
+        - name: commit
+          value: $(tasks.calculate-commit-sha.results.string-result)
+        - name: config-file
+          value: $(params.gitversion-config-file)
+      taskRef:
+        resolver: hub
+        params:
+          - name: catalog
+            value: extras
+          - name: kind
+            value: task
+          - name: name
+            value: git-version
+          - name: version
+            value: "0.2"
+      timeout: 10m0s
+      workspaces:
+        - name: source
+          workspace: source
+        - name: basic-auth
+          workspace: basic-auth
+        - name: config
+          workspace: gitversion-config
+
+    - name: build-operator-bundle
+      timeout: 50m
+      retries: 0
+      taskRef:
+        resolver: hub
+        params:
+          - name: catalog
+            value: extras
+          - name: kind
+            value: task
+          - name: name
+            value: build-operator-bundle
+          - name: version
+            value: "0.1"
+      workspaces:
+        - name: source
+          workspace: source
+      params:
+        - name: builder-image
+          value: registry.alauda.cn:60080/devops/operator-bundle-builder:latest
+        - name: command
+          value: |
+            sleep 3600
+            make bundle
+        - name: environments
+          value:
+            # The first element is the commit sha, the second element is the commit date
+            - SOURCE_DATE_EPOCH=$(tasks.calculate-commit-sha.results.array-result[1])
+
+    - name: build-image
+      runAfter:
+        - build-operator-bundle
+      timeout: 50m
+      retries: 0
+      taskRef:
+        resolver: hub
+        params:
+          - name: catalog
+            value: extras
+          - name: kind
+            value: task
+          - name: name
+            value: buildx
+          - name: version
+            value: "0.1"
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
+      params:
+        - name: buildx-image
+          value: registry.alauda.cn:60080/devops/alauda-docker-buildx:latest
+        - name: image-url
+          value: $(params.image-repository)
+        - name: image-tags
+          value:
+            - v$(tasks.git-version.results.variables.FullSemVer)
+        - name: dockerfile
+          value: $(params.dockerfile-path)
+        - name: context
+          value: $(params.context)
+        - name: environments
+          value:
+            - BUILDX_NO_DEFAULT_ATTESTATIONS=1
+            # The first element is the commit sha, the second element is the commit date
+            - SOURCE_DATE_EPOCH=$(tasks.calculate-commit-sha.results.array-result[1])
+        - name: labels
+          value:
+            - branch=$(params.git-revision)
+            # The first element is the commit sha, the second element is the commit date
+            - commit=$(tasks.calculate-commit-sha.results.array-result[0])
+        - name: extra-args
+          value:
+            - --build-arg version=$(params.git-version)
+            - --build-arg commit_id=$(tasks.calculate-commit-sha.results.string-result)
+            - --output type=registry,rewrite-timestamp=true
+            - $(params.build-extra-args[*])
+
+    - name: image-scan
+      timeout: 60m
+      retries: 0
+      taskRef:
+        resolver: katanomi.hub
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: trivy-image-scan
+      workspaces:
+        - name: source
+          workspace: source
+        - name: cache
+          workspace: cache
+      when:
+        - input: $(params.ignore-trivy-scan)
+          operator: in
+          values:
+            - "false"
+      params:
+        - name: targets
+          value:
+            - $(tasks.build-image.results.image-digests[*])
+        - name: scan-flags
+          value:
+            - vulnerability.ignore-unfixed=true
+            - db.skip-update=false
+            - db.repository=build-harbor.alauda.cn/ops/aquasecurity/trivy-db
+            # java 项目需要更新 java 漏洞库。因为漏洞库比较大，非 java 项目不要加
+            - db.skip-java-db-update=false
+            - db.java-repository=build-harbor.alauda.cn/ops/aquasecurity/trivy-java-db
